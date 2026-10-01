@@ -65,14 +65,14 @@ commitments.
 The current Worker contract supports `python`, `javascript`, and `rust`; tiers
 are `nano`, `standard`, and `heavy`. `code` must be a non-empty string of at most
 100,000 characters. `timeoutMs` defaults to 5,000 and is capped at 10,000 ms.
-The requested tier defaults to `standard`. Requests require a ****** key, a
+The requested tier defaults to `standard`. Requests require an API key, a
 payment receipt, or both.
 
 ### Request flow
 
 1. The Worker checks method, content type, body size, JSON shape, language, tier,
    and timeout before contacting execution services.
-2. It checks the tenant in `AUTH_KV` when a ****** is provided. A missing,
+2. It checks the tenant in `AUTH_KV` when an API key is provided. A missing,
    inactive, exhausted, or over-concurrency tenant is rejected. KV values are
    snapshots; the gateway remains responsible for atomic balance and quota
    enforcement.

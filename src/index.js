@@ -27,6 +27,11 @@ function paymentRequired() {
   );
 }
 
+async function tenantKeyId(apiKey) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(apiKey));
+  return `key:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+}
+
 function parseTriage(response) {
   let result = response;
   if (typeof result === 'string') {
@@ -102,13 +107,26 @@ async function execute(request, env, ctx) {
     return json({ error: 'Request body too large' }, 413);
   }
 
+  let body;
+  try {
+    body = await request.text();
+  } catch {
+    return json({ error: 'Invalid request body' }, 400);
+  }
+  if (new TextEncoder().encode(body).byteLength > MAX_CODE_LENGTH + 4096) {
+    return json({ error: 'Request body too large' }, 413);
+  }
+
   let payload;
   try {
-    payload = await request.json();
+    payload = JSON.parse(body);
   } catch {
     return json({ error: 'Invalid JSON request body' }, 400);
   }
 
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return json({ error: 'Invalid request body' }, 400);
+  }
   if (typeof payload.code !== 'string' || payload.code.length === 0) {
     return json({ error: 'Missing code payload' }, 400);
   }
@@ -144,15 +162,19 @@ async function execute(request, env, ctx) {
     if (
       !tenant ||
       tenant.active !== true ||
-      typeof tenant.quotaRemaining !== 'number' ||
+      !Number.isFinite(tenant.quotaRemaining) ||
       tenant.quotaRemaining <= 0 ||
-      (Number.isFinite(tenant.activeRuns) &&
-        Number.isFinite(tenant.maxConcurrentRuns) &&
-        tenant.activeRuns >= tenant.maxConcurrentRuns)
+      ((tenant.activeRuns !== undefined || tenant.maxConcurrentRuns !== undefined) &&
+        (!Number.isFinite(tenant.activeRuns) ||
+          !Number.isFinite(tenant.maxConcurrentRuns) ||
+          tenant.activeRuns < 0 ||
+          tenant.maxConcurrentRuns <= 0 ||
+          tenant.activeRuns >= tenant.maxConcurrentRuns))
     ) {
       return json({ error: 'Tenant unauthorized or quota exhausted' }, 403);
     }
-    tenantId = typeof tenant.id === 'string' && tenant.id ? tenant.id : apiKey;
+    tenantId =
+      typeof tenant.id === 'string' && tenant.id ? tenant.id : await tenantKeyId(apiKey);
   }
 
   const idempotencyKey = request.headers.get('Idempotency-Key') || crypto.randomUUID();
@@ -285,7 +307,23 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/v1/billing/challenge') {
       if (request.method !== 'GET') return json({ error: 'Method Not Allowed' }, 405, { Allow: 'GET' });
-      return paymentRequired();
+      if (!env.PAYMENT_GATEWAY) return json({ error: 'Payment service unavailable' }, 503);
+      const tier = url.searchParams.get('tier') ?? 'standard';
+      if (!TIERS.has(tier)) return json({ error: 'Unsupported resource tier' }, 400);
+      try {
+        const response = await env.PAYMENT_GATEWAY.fetch(
+          `https://payment-gateway/challenge?tier=${tier}`,
+        );
+        if (!response.ok) return json({ error: 'Payment service unavailable' }, 503);
+        const challenge = await response.json();
+        return json({
+          protocol: 'HTTP-402',
+          pricing: { nano: '$0.001/run', standard: '$0.003/run', heavy: '$0.010/run' },
+          challenge,
+        });
+      } catch {
+        return json({ error: 'Payment service unavailable' }, 503);
+      }
     }
     if (url.pathname !== '/v1/execute') return json({ error: 'Not Found' }, 404);
     return execute(request, env, ctx);

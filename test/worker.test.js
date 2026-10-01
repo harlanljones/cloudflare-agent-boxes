@@ -22,8 +22,9 @@ function setup({ triage = { safe: true, tier: 'nano', threatScore: 0, reason: ''
       },
     },
     PAYMENT_GATEWAY: {
-      async fetch(url, init) {
-        const body = JSON.parse(init.body);
+      async fetch(url, init = {}) {
+        if (url.includes('/challenge')) return response({ challenge: 'signed-challenge' });
+        const body = init.body ? JSON.parse(init.body) : {};
         calls.payment.push({ url, body });
         if (url.endsWith('/authorize')) {
           return paymentStatus === 200
@@ -73,6 +74,19 @@ test('requires payment credentials before allocating resources', async () => {
   assert.equal(calls.container.length, 0);
 });
 
+test('accepts a payment receipt without an API key', async () => {
+  const { env, ctx, calls } = setup();
+  const res = await worker.fetch(
+    request(execution, { Authorization: '', 'X-402-Payment-Receipt': 'receipt' }),
+    env,
+    ctx,
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(calls.payment[0].body.tenantId, 'anonymous');
+  assert.equal(calls.payment[0].body.receipt, 'receipt');
+});
+
 test('rejects unauthorized tenants before payment or execution', async () => {
   const { env, ctx, calls } = setup();
   env.AUTH_KV.get = async () => ({ active: false, quotaRemaining: 10 });
@@ -81,6 +95,42 @@ test('rejects unauthorized tenants before payment or execution', async () => {
   assert.equal(res.status, 403);
   assert.equal(calls.payment.length, 0);
   assert.equal(calls.container.length, 0);
+});
+
+test('rejects invalid quota snapshots before payment', async (t) => {
+  for (const tenant of [
+    { active: true, quotaRemaining: Number.NaN },
+    { active: true, quotaRemaining: 1, activeRuns: 1, maxConcurrentRuns: 1 },
+    { active: true, quotaRemaining: 1, activeRuns: 0 },
+  ]) {
+    await t.test(JSON.stringify(tenant), async () => {
+      const { env, ctx, calls } = setup();
+      env.AUTH_KV.get = async () => tenant;
+      const res = await worker.fetch(request(), env, ctx);
+      assert.equal(res.status, 403);
+      assert.equal(calls.payment.length, 0);
+    });
+  }
+});
+
+test('rejects non-object JSON payloads and provides gateway payment challenges', async (t) => {
+  await t.test('non-object request payload', async () => {
+    const { env, ctx, calls } = setup();
+    const res = await worker.fetch(request(null), env, ctx);
+    assert.equal(res.status, 400);
+    assert.equal(calls.payment.length, 0);
+  });
+
+  await t.test('signed payment challenge', async () => {
+    const { env } = setup();
+    const res = await worker.fetch(
+      new Request('https://worker.test/v1/billing/challenge?tier=nano'),
+      env,
+      {},
+    );
+    assert.equal(res.status, 200);
+    assert.deepEqual((await res.json()).challenge, { challenge: 'signed-challenge' });
+  });
 });
 
 test('executes only after payment and safe triage, with bounded sandbox policy', async () => {

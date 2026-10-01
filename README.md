@@ -21,7 +21,8 @@ Supported languages are `python`, `javascript`, and `rust`; tiers are `nano`,
 `standard`, and `heavy`. The code limit is 100,000 characters and the timeout is
 capped at 10 seconds. Requests need a `Bearer` API key or an
 `X-402-Payment-Receipt`.
-`GET /v1/billing/challenge` returns the HTTP 402 pricing manifest.
+`GET /v1/billing/challenge?tier=nano` obtains the cryptographic payment challenge
+and pricing manifest for the selected tier.
 
 ## Cloudflare bindings
 
@@ -30,7 +31,7 @@ Configure these bindings for the Worker:
 | Binding | Type | Contract |
 | --- | --- | --- |
 | `AUTH_KV` | KV namespace | `tenant:<api-key>` JSON containing `active`, `quotaRemaining`, and optionally `id`, `activeRuns`, and `maxConcurrentRuns`. |
-| `PAYMENT_GATEWAY` | Service binding | `POST /authorize` reserves payment for the requested tier and returns `{ "approved": true, "authorizationId": "..." }` (optionally `tenantId`). `/settle` accepts the final tier; `/void` releases an unused authorization. The service must atomically enforce balances, receipt replay protection, and authoritative quotas. |
+| `PAYMENT_GATEWAY` | Service binding | `GET /challenge?tier=...` returns a payment challenge. `POST /authorize` reserves payment for the requested tier and returns `{ "approved": true, "authorizationId": "..." }` (optionally `tenantId`). `/settle` accepts the final tier; `/void` releases an unused authorization. The service must atomically enforce balances, receipt replay protection, and authoritative quotas. |
 | `AI` | Workers AI | Supports `run('@cf/cloudflare/clef-flash', { prompt })` and returns triage JSON. Invalid or unavailable triage fails closed. |
 | `CONTAINER_RUNNER` | Service binding | `POST /run` executes the payload and returns `stdout`, `stderr`, `exitCode`, `cpuTimeMs`, and `peakMemMb`. |
 | `K2_TELEMETRY` | K2 stream binding | Accepts events with `send(event)`. |

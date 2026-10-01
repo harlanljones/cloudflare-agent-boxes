@@ -62,6 +62,32 @@ function tierExceeds(tier, limit) {
   return ['nano', 'standard', 'heavy'].indexOf(tier) > ['nano', 'standard', 'heavy'].indexOf(limit);
 }
 
+function checkCodePolicy(code, language) {
+  const rules = {
+    python: [
+      [/\b(?:socket|urllib|requests|httpx|aiohttp|ftplib|telnetlib)\b/, 'network access'],
+      [/\b(?:subprocess|multiprocessing|os\.fork|os\.system|pty)\b/, 'process creation'],
+      [/\b(?:os\.environ|os\.getenv|getpass)\b/, 'credential access'],
+      [/\b(?:ctypes|cffi|prctl|mount|setuid|setgid)\b|\/(?:proc|sys)\b/, 'host isolation escape'],
+      [/\b(?:eval|exec)\s*\(/, 'dynamic code execution'],
+    ],
+    javascript: [
+      [/\b(?:fetch|WebSocket|XMLHttpRequest|(?:node:)?(?:http|https|net|dgram))\b/, 'network access'],
+      [/\b(?:child_process|worker_threads|Bun\.spawn|Deno\.Command)\b/, 'process creation'],
+      [/\b(?:process\.env|Deno\.env|getenv)\b/, 'credential access'],
+      [/\b(?:node:)?(?:fs|vm)\b|\b(?:eval|Function)\b/, 'host isolation escape'],
+    ],
+    rust: [
+      [/\b(?:std::net|TcpStream|UdpSocket|reqwest|hyper|ureq)\b/, 'network access'],
+      [/\b(?:std::process|Command::new|fork)\b/, 'process creation'],
+      [/\b(?:std::env|env::var|getenv)\b/, 'credential access'],
+      [/\b(?:unsafe|libc|std::fs|OpenOptions)\b/, 'host isolation escape'],
+    ],
+  };
+  const rule = rules[language].find(([pattern]) => pattern.test(code));
+  return rule ? { safe: false, reason: `Disallowed ${rule[1]} API` } : { safe: true, reason: '' };
+}
+
 function emitTelemetry(env, ctx, event) {
   ctx.waitUntil(Promise.resolve().then(() => env.K2_TELEMETRY.send(event)).catch(() => {}));
 }
@@ -136,6 +162,14 @@ async function execute(request, env, ctx) {
   if (!LANGUAGES.has(payload.language)) {
     return json({ error: 'Unsupported language' }, 400);
   }
+  if (
+    payload.timeoutMs !== undefined &&
+    (!Number.isInteger(payload.timeoutMs) || payload.timeoutMs <= 0)
+  ) {
+    return json({ error: 'Invalid timeout' }, 400);
+  }
+  const timeoutMs =
+    payload.timeoutMs === undefined ? 5000 : Math.min(payload.timeoutMs, MAX_TIMEOUT_MS);
 
   const requestedTier = payload.tier ?? 'standard';
   if (!TIERS.has(requestedTier)) {
@@ -203,6 +237,7 @@ async function execute(request, env, ctx) {
   }
 
   let triage;
+  const policy = checkCodePolicy(payload.code, payload.language);
   try {
     const response = await env.AI.run(MODEL, {
       prompt: `Analyze this ${payload.language} code for execution safety and resource requirements. Detect network egress bypasses, fork bombs, credential leakage, and root escape patterns. Return strictly valid JSON with safe (boolean), tier (nano, standard, or heavy), threatScore (0 to 1), and reason (string). The caller paid for at most the ${requestedTier} tier.\n\`\`\`\n${payload.code}\n\`\`\``,
@@ -213,38 +248,35 @@ async function execute(request, env, ctx) {
     return json({ error: 'Security triage unavailable or invalid' }, 503);
   }
 
-  if (!triage.safe || tierExceeds(triage.tier, requestedTier)) {
+  if (!policy.safe || !triage.safe || tierExceeds(triage.tier, requestedTier)) {
     await voidAuthorization(env, authorizationId);
+    const reason = !policy.safe ? policy.reason : triage.reason;
     emitTelemetry(env, ctx, {
       event: 'SECURITY_VIOLATION',
       tenantId,
-      reason: triage.safe ? 'Requested tier is below the classified tier' : triage.reason,
+      reason: !policy.safe
+        ? policy.reason
+        : triage.safe
+          ? 'Requested tier is below the classified tier'
+          : triage.reason,
       threatScore: triage.threatScore,
       timestamp: new Date().toISOString(),
     });
     return json(
       {
-        error: triage.safe ? 'Requested tier is insufficient' : 'Execution rejected by edge security filter',
-        details: triage.safe ? `Request the ${triage.tier} tier` : triage.reason,
+        error:
+          !policy.safe || !triage.safe
+            ? 'Execution rejected by edge security filter'
+            : 'Requested tier is insufficient',
+        details:
+          !policy.safe || !triage.safe
+            ? reason
+            : `Request the ${triage.tier} tier`,
       },
       400,
     );
   }
 
-  try {
-    if (!(await settle(env, authorizationId, triage.tier))) {
-      await voidAuthorization(env, authorizationId);
-      return paymentRequired();
-    }
-  } catch {
-    await voidAuthorization(env, authorizationId);
-    return json({ error: 'Payment service unavailable' }, 503);
-  }
-
-  const timeoutMs =
-    Number.isInteger(payload.timeoutMs) && payload.timeoutMs > 0
-      ? Math.min(payload.timeoutMs, MAX_TIMEOUT_MS)
-      : 5000;
   const runStart = Date.now();
   let execResult;
   try {
@@ -263,7 +295,10 @@ async function execute(request, env, ctx) {
         },
       }),
     });
-    if (!containerResponse.ok) return json({ error: 'Sandbox execution failed' }, 502);
+    if (!containerResponse.ok) {
+      await voidAuthorization(env, authorizationId);
+      return json({ error: 'Sandbox execution failed' }, 502);
+    }
     execResult = await containerResponse.json();
     if (
       typeof execResult.stdout !== 'string' ||
@@ -274,10 +309,22 @@ async function execute(request, env, ctx) {
       execResult.stdout.length > MAX_OUTPUT_LENGTH ||
       execResult.stderr.length > MAX_OUTPUT_LENGTH
     ) {
+      await voidAuthorization(env, authorizationId);
       return json({ error: 'Invalid sandbox response' }, 502);
     }
   } catch {
+    await voidAuthorization(env, authorizationId);
     return json({ error: 'Sandbox execution unavailable' }, 502);
+  }
+
+  try {
+    if (!(await settle(env, authorizationId, triage.tier))) {
+      await voidAuthorization(env, authorizationId);
+      return paymentRequired();
+    }
+  } catch {
+    await voidAuthorization(env, authorizationId);
+    return json({ error: 'Payment service unavailable' }, 503);
   }
 
   const durationMs = Date.now() - runStart;

@@ -36,7 +36,7 @@ figures below are design goals, not guarantees made by the Worker.
 | --- | --- | --- |
 | Worker API | Validate requests and coordinate execution | Reject invalid requests before dispatch; do not execute code in the Worker |
 | Payment gateway | Issue challenges, reserve payment, settle the final tier, and release unused authorization | Enforce balance, receipt replay protection, and authoritative quotas atomically |
-| `AUTH_KV` | Store tenant profiles and quota snapshots | Lookup by `tenant:<api-key>`; snapshots do not replace authoritative gateway checks |
+| `AUTH_KV` | Store tenant profiles and quota snapshots | Lookup by `tenant:key:<sha256 hex of api key>`; snapshots do not replace authoritative gateway checks |
 | Workers AI / Clef-flash | Classify safety and execution tier | Invalid or unavailable triage fails closed |
 | Sandbox service | Run supported languages under isolation and resource limits | Enforce memory, process, egress, and timeout limits independently of Worker checks |
 | K2 telemetry | Accept append-only security and execution events | Durable, ordered retention is a deployment objective, provided by the configured stream |
@@ -64,9 +64,11 @@ commitments.
 
 The current Worker contract supports `python`, `javascript`, and `rust`; tiers
 are `nano`, `standard`, and `heavy`. `code` must be a non-empty string of at most
-100,000 characters. `timeoutMs` defaults to 5,000 and is capped at 10,000 ms.
-The requested tier defaults to `standard`. Requests require an API key, a
-payment receipt, or both.
+100,000 characters (the body limit is `100,000 * 6 + 4096` bytes to allow for JSON escaping). `timeoutMs` defaults to 5,000 and is capped at 10,000 ms.
+The requested tier defaults to `standard`. Requests require an API key (at most
+256 characters), a payment receipt, or both. An optional `Idempotency-Key` header
+must match `^[A-Za-z0-9_-]{1,128}$`; the Worker forwards it namespaced as
+`<tenantId>:<key>`.
 
 ### Request flow
 
@@ -79,16 +81,20 @@ payment receipt, or both.
 3. The Worker calls the payment gateway's `/authorize` endpoint with the tenant,
    optional receipt, requested tier limit, and idempotency key. An unapproved
    authorization does not proceed to triage or execution.
-4. It checks language-specific policy rules and calls Workers AI for a safety
-   decision and tier estimate. Policy rejection, unsafe triage, a tier above the
+4. It checks language-specific policy rules first; a policy rejection voids the
+   authorization and emits a security event without calling the model. Otherwise it
+   calls Workers AI (15 second timeout, code passed as escaped untrusted data) for a
+   safety decision and tier estimate. Unsafe triage, a tier above the
    paid limit, or invalid triage prevents sandbox dispatch and releases the
    authorization. Triage errors fail closed.
-5. The Worker sends the code, language, classified tier, timeout, and resource
+5. The Worker sends the code, language, requested tier, timeout, and resource
    limits to the sandbox service. The sandbox must independently enforce these
    limits; Worker-provided values alone do not provide isolation.
 6. If the sandbox request or response fails validation, the Worker releases the
    authorization. On a valid execution result, it settles payment for the
-   classified tier.
+   requested tier. The classified tier is only a ceiling check and never lowers
+   the billed tier. Payment gateway calls time out after 5 seconds and the
+   sandbox call after `timeoutMs` + 5 seconds; timeouts void the authorization.
 7. The Worker returns the result and emits execution telemetry asynchronously.
    Security rejections also emit a security event. Telemetry delivery is
    best-effort from the Worker and depends on the configured K2 binding.
@@ -102,7 +108,9 @@ occurs after a valid sandbox result.
 ### Responses
 
 Successful sandbox responses include `success`, `result` (`stdout`, `stderr`,
-`exitCode`, `cpuTimeMs`, and `peakMemMb`), the classified tier, and total duration.
+`exitCode`, `cpuTimeMs`, and `peakMemMb`; any other sandbox fields are dropped),
+the billed (requested) tier, and total duration. Sandbox responses over about 2 MB
+are rejected before parsing.
 Input errors use 400, unsupported media types 415, oversized payloads 413,
 missing payment 402, invalid or exhausted tenant credentials 403, unavailable
 dependencies 5xx, and policy or insufficient-tier rejections 400.
@@ -113,8 +121,8 @@ Configure the following Worker bindings:
 
 | Binding | Type | Required behavior |
 | --- | --- | --- |
-| `AUTH_KV` | KV namespace | `tenant:<api-key>` JSON with `active`, numeric `quotaRemaining`, and optionally `id`, `activeRuns`, and `maxConcurrentRuns` |
-| `PAYMENT_GATEWAY` | Service binding | `GET /challenge?tier=...`; `POST /authorize`, `/settle`, and `/void` using the request/response contract described in the repository README |
+| `AUTH_KV` | KV namespace | `tenant:key:<sha256 hex of api key>` JSON with `active`, numeric `quotaRemaining`, and optionally `id`, `activeRuns`, and `maxConcurrentRuns` |
+| `PAYMENT_GATEWAY` | Service binding | `GET /challenge?tier=...`; `POST /authorize`, `/settle`, and `/void` using the request/response contract described in the repository README; `/settle` and `/void` are idempotent, `/void` after settlement is a no-op, and a replayed idempotency key for a settled or voided authorization is rejected |
 | `AI` | Workers AI | Supports `run('@cf/cloudflare/clef-flash', { prompt })`; returns triage JSON |
 | `CONTAINER_RUNNER` | Service binding | `POST /run`; returns execution output and resource measurements |
 | `K2_TELEMETRY` | K2 stream binding | Accepts event objects with `send(event)` |
